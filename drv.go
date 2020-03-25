@@ -137,112 +137,110 @@ type connPool struct {
 	serverVersion VersionInfo
 }
 
-func (d *drv) openPool(P *PoolParams) (*connPool, error) {
+func (d *drv) openPool(P PoolParams) (*connPool, error) {
+	// determine key to use for pool
+	poolKey := fmt.Sprintf("%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%t\t%t\t",
+		P.UserName, P.Password, P.DSN, P.MinSessions, P.MaxSessions,
+		P.SessionIncrement, P.WaitTimeout, P.MaxLifeTime, P.SessionTimeout,
+		P.Heterogeneous, P.EnableEvents)
+	if Log != nil {
+		Log("pool key", poolKey)
+	}
 
-    // determine key to use for pool
-    poolKey := fmt.Sprintf("%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%t\t%t\t",
-            P.UserName, P.Password, P.DSN, P.MinSessions, P.MaxSessions,
-            P.SessionIncrement, P.WaitTimeout, P.MaxLifeTime, P.SessionTimeout,
-            P.Heterogeneous, P.EnableEvents)
-    if Log != nil {
-        Log("pool key", poolKey)
-    }
+	// if pool already exists, return it immediately
+	d.mu.Lock()
+	pool, ok := d.pools[poolKey]
+	d.mu.Unlock()
+	if ok {
+		return pool, nil
+	}
 
-    // if pool already exists, return it immediately
-    d.mu.Lock()
-    pool, ok := d.pools[poolKey]
-    d.mu.Unlock()
-    if ok {
-        return pool, nil
-    }
+	// initialize driver, if necessary
+	if err := d.init(); err != nil {
+		return nil, err
+	}
 
-    // initialize driver, if necessary
-    if err := d.init(); err != nil {
-        return nil, err
-    }
+	var cUserName, cPassword, cDSN *C.char
+	if P.UserName != "" {
+		cUserName = C.CString(P.UserName)
+		defer C.free(unsafe.Pointer(cUserName))
+	}
+	if P.Password != "" {
+		cPassword = C.CString(P.Password)
+		defer C.free(unsafe.Pointer(cPassword))
+	}
+	if P.DSN != "" {
+		cDSN = C.CString(P.DSN)
+		defer C.free(unsafe.Pointer(cDSN))
+	}
+	cUTF8 := C.CString("AL32UTF8")
+	defer C.free(unsafe.Pointer(cUTF8))
+	cDriverName := C.CString(DriverName)
+	defer C.free(unsafe.Pointer(cDriverName))
+	var commonCreateParams C.dpiCommonCreateParams
+	if C.dpiContext_initCommonCreateParams(d.dpiContext, &commonCreateParams) == C.DPI_FAILURE {
+		return nil, errors.Errorf("initCommonCreateParams: %w", d.getError())
+	}
+	commonCreateParams.createMode = C.DPI_MODE_CREATE_DEFAULT | C.DPI_MODE_CREATE_THREADED
+	if P.EnableEvents {
+		commonCreateParams.createMode |= C.DPI_MODE_CREATE_EVENTS
+	}
+	commonCreateParams.encoding = cUTF8
+	commonCreateParams.nencoding = cUTF8
+	commonCreateParams.driverName = cDriverName
+	commonCreateParams.driverNameLength = C.uint32_t(len(DriverName))
 
-    var cUserName, cPassword, cDSN *C.char
-    if P.UserName != "" {
-        cUserName = C.CString(P.UserName)
-        defer C.free(unsafe.Pointer(cUserName))
-    }
-    if P.Password != "" {
-        cPassword = C.CString(P.Password)
-        defer C.free(unsafe.Pointer(cPassword))
-    }
-    if P.DSN != "" {
-        cDSN = C.CString(P.DSN)
-        defer C.free(unsafe.Pointer(cDSN))
-    }
-    cUTF8 := C.CString("AL32UTF8")
-    defer C.free(unsafe.Pointer(cUTF8))
-    cDriverName := C.CString(DriverName)
-    defer C.free(unsafe.Pointer(cDriverName))
-    var commonCreateParams C.dpiCommonCreateParams
-    if C.dpiContext_initCommonCreateParams(d.dpiContext, &commonCreateParams) == C.DPI_FAILURE {
-        return nil, errors.Errorf("initCommonCreateParams: %w", d.getError())
-    }
-    commonCreateParams.createMode = C.DPI_MODE_CREATE_DEFAULT | C.DPI_MODE_CREATE_THREADED
-    if P.EnableEvents {
-        commonCreateParams.createMode |= C.DPI_MODE_CREATE_EVENTS
-    }
-    commonCreateParams.encoding = cUTF8
-    commonCreateParams.nencoding = cUTF8
-    commonCreateParams.driverName = cDriverName
-    commonCreateParams.driverNameLength = C.uint32_t(len(DriverName))
+	var poolCreateParams C.dpiPoolCreateParams
+	if C.dpiContext_initPoolCreateParams(d.dpiContext, &poolCreateParams) == C.DPI_FAILURE {
+		return nil, errors.Errorf("initPoolCreateParams: %w", d.getError())
+	}
+	poolCreateParams.minSessions = DefaultPoolMinSessions
+	if P.MinSessions >= 0 {
+		poolCreateParams.minSessions = C.uint32_t(P.MinSessions)
+	}
+	poolCreateParams.maxSessions = DefaultPoolMaxSessions
+	if P.MaxSessions > 0 {
+		poolCreateParams.maxSessions = C.uint32_t(P.MaxSessions)
+	}
+	poolCreateParams.sessionIncrement = DefaultPoolIncrement
+	if P.SessionIncrement > 0 {
+		poolCreateParams.sessionIncrement = C.uint32_t(P.SessionIncrement)
+	}
+	poolCreateParams.getMode = C.DPI_MODE_POOL_GET_TIMEDWAIT
+	poolCreateParams.timeout = C.uint32_t(DefaultSessionTimeout / time.Second)
+	if P.SessionTimeout > 0 {
+		poolCreateParams.timeout = C.uint32_t(P.SessionTimeout / time.Second) // seconds before idle pool sessions get evicted
+	}
+	poolCreateParams.waitTimeout = C.uint32_t(DefaultWaitTimeout / time.Millisecond)
+	if P.WaitTimeout > 0 {
+		poolCreateParams.waitTimeout = C.uint32_t(P.WaitTimeout / time.Millisecond) // milliseconds to wait for a session to become available
+	}
+	poolCreateParams.maxLifetimeSession = C.uint32_t(DefaultMaxLifeTime / time.Second)
+	if P.MaxLifeTime > 0 {
+		poolCreateParams.maxLifetimeSession = C.uint32_t(P.MaxLifeTime / time.Second) // maximum time in seconds till a pooled session may exist
+	}
 
-    var poolCreateParams C.dpiPoolCreateParams
-    if C.dpiContext_initPoolCreateParams(d.dpiContext, &poolCreateParams) == C.DPI_FAILURE {
-        return nil, errors.Errorf("initPoolCreateParams: %w", d.getError())
-    }
-    poolCreateParams.minSessions = DefaultPoolMinSessions
-    if P.MinSessions >= 0 {
-            poolCreateParams.minSessions = C.uint32_t(P.MinSessions)
-    }
-    poolCreateParams.maxSessions = DefaultPoolMaxSessions
-    if P.MaxSessions > 0 {
-        poolCreateParams.maxSessions = C.uint32_t(P.MaxSessions)
-    }
-    poolCreateParams.sessionIncrement = DefaultPoolIncrement
-    if P.SessionIncrement > 0 {
-        poolCreateParams.sessionIncrement = C.uint32_t(P.SessionIncrement)
-    }
-    poolCreateParams.getMode = C.DPI_MODE_POOL_GET_TIMEDWAIT
-    poolCreateParams.timeout = C.uint32_t(DefaultSessionTimeout / time.Second)
-    if P.SessionTimeout > 0 {
-        poolCreateParams.timeout = C.uint32_t(P.SessionTimeout / time.Second) // seconds before idle pool sessions get evicted
-    }
-    poolCreateParams.waitTimeout = C.uint32_t(DefaultWaitTimeout / time.Millisecond)
-    if P.WaitTimeout > 0 {
-        poolCreateParams.waitTimeout = C.uint32_t(P.WaitTimeout / time.Millisecond) // milliseconds to wait for a session to become available
-    }
-    poolCreateParams.maxLifetimeSession = C.uint32_t(DefaultMaxLifeTime / time.Second)
-    if P.MaxLifeTime > 0 {
-        poolCreateParams.maxLifetimeSession = C.uint32_t(P.MaxLifeTime / time.Second) // maximum time in seconds till a pooled session may exist
-    }
-
-    var dp *C.dpiPool
-    if Log != nil {
-        Log("C", "dpiPool_create", "username", P.UserName, "DSN", P.DSN, "common", commonCreateParams, "pool", fmt.Sprintf("%#v", poolCreateParams))
-    }
-    if C.dpiPool_create(
-            d.dpiContext,
-            cUserName, C.uint32_t(len(P.UserName)),
-            cPassword, C.uint32_t(len(P.Password)),
-            cDSN, C.uint32_t(len(P.DSN)),
-            &commonCreateParams,
-            &poolCreateParams,
-            (**C.dpiPool)(unsafe.Pointer(&dp)),
-    ) == C.DPI_FAILURE {
-        return nil, errors.Errorf("params=%v %w", P, d.getError())
-    }
-    C.dpiPool_setStmtCacheSize(dp, 40)
-    d.mu.Lock()
-    d.pools[poolKey] = &connPool{dpiPool: dp}
-    d.mu.Unlock()
-    return d.pools[poolKey], nil
+	var dp *C.dpiPool
+	if Log != nil {
+		Log("C", "dpiPool_create", "username", P.UserName, "DSN", P.DSN, "common", commonCreateParams, "pool", fmt.Sprintf("%#v", poolCreateParams))
+	}
+	if C.dpiPool_create(
+		d.dpiContext,
+		cUserName, C.uint32_t(len(P.UserName)),
+		cPassword, C.uint32_t(len(P.Password)),
+		cDSN, C.uint32_t(len(P.DSN)),
+		&commonCreateParams,
+		&poolCreateParams,
+		(**C.dpiPool)(unsafe.Pointer(&dp)),
+	) == C.DPI_FAILURE {
+		return nil, errors.Errorf("params=%v %w", P, d.getError())
+	}
+	C.dpiPool_setStmtCacheSize(dp, 40)
+	d.mu.Lock()
+	d.pools[poolKey] = &connPool{dpiPool: dp}
+	d.mu.Unlock()
+	return d.pools[poolKey], nil
 }
-
 
 func (d *drv) init() error {
 	d.mu.Lock()
@@ -305,7 +303,12 @@ func (d *drv) openConn(P ConnectionParams) (*conn, error) {
 		}()
 	}
 
-	if !(P.IsSysDBA || P.IsSysOper || P.IsSysASM || P.IsPrelim || P.StandaloneConnection) {
+	if P.IsSysDBA || P.IsSysOper || P.IsSysASM || P.IsPrelim || P.StandaloneConnection {
+		// no pool
+		c.connParams = P
+		return c, c.acquireConn(P.ConnParams.UserName, P.ConnParams.Password, P.ConnClass)
+	}
+	{
 		d.mu.Lock()
 		dp := d.pools[connString]
 		d.mu.Unlock()
@@ -316,14 +319,14 @@ func (d *drv) openConn(P ConnectionParams) (*conn, error) {
 		}
 	}
 
-	extAuth := C.int(b2i(P.Username == "" && P.Password == ""))
+	extAuth := C.int(b2i(P.PoolParams.UserName == "" && P.PoolParams.Password == ""))
 	var cUserName, cPassword, cNewPassword, cConnClass *C.char
-	if !(P.Username == "" && P.Password == "") {
-		cUserName, cPassword = C.CString(P.Username), C.CString(P.Password)
+	if !(P.PoolParams.UserName == "" && P.PoolParams.Password == "") {
+		cUserName, cPassword = C.CString(P.PoolParams.UserName), C.CString(P.PoolParams.Password)
 	}
 	var cSid *C.char
-	if P.SID != "" {
-		cSid = C.CString(P.SID)
+	if P.DSN != "" {
+		cSid = C.CString(P.DSN)
 	}
 	defer func() {
 		if cUserName != nil {
@@ -353,11 +356,6 @@ func (d *drv) openConn(P ConnectionParams) (*conn, error) {
 	commonCreateParams.driverName = cDriverName
 	commonCreateParams.driverNameLength = C.uint32_t(len(DriverName))
 
-	if P.IsSysDBA || P.IsSysOper || P.IsSysASM || P.IsPrelim || P.StandaloneConnection {
-		// no pool
-		c.connParams = P
-		return c, c.acquireConn(P.Username, P.Password, P.ConnClass)
-	}
 	var poolCreateParams C.dpiPoolCreateParams
 	if C.dpiContext_initPoolCreateParams(d.dpiContext, &poolCreateParams) == C.DPI_FAILURE {
 		return nil, errors.Errorf("initPoolCreateParams: %w", d.getError())
@@ -371,10 +369,10 @@ func (d *drv) openConn(P ConnectionParams) (*conn, error) {
 		poolCreateParams.maxSessions = C.uint32_t(P.MaxSessions)
 	}
 	poolCreateParams.sessionIncrement = DefaultPoolIncrement
-	if P.PoolIncrement > 0 {
-		poolCreateParams.sessionIncrement = C.uint32_t(P.PoolIncrement)
+	if P.SessionIncrement > 0 {
+		poolCreateParams.sessionIncrement = C.uint32_t(P.SessionIncrement)
 	}
-	if extAuth == 1 || P.HeterogeneousPool {
+	if extAuth == 1 || P.Heterogeneous {
 		poolCreateParams.homogeneous = 0
 	}
 	poolCreateParams.externalAuth = extAuth
@@ -392,15 +390,15 @@ func (d *drv) openConn(P ConnectionParams) (*conn, error) {
 		poolCreateParams.maxLifetimeSession = C.uint32_t(P.MaxLifeTime / time.Second) // maximum time in seconds till a pooled session may exist
 	}
 
-	var dp *C.dpiPool
 	if Log != nil {
-		Log("C", "dpiPool_create", "username", P.Username, "conn", connString, "sid", P.SID, "common", commonCreateParams, "pool", fmt.Sprintf("%#v", poolCreateParams))
+		Log("C", "dpiPool_create", "username", P.PoolParams.UserName, "conn", connString, "dsn", P.DSN, "common", commonCreateParams, "pool", fmt.Sprintf("%#v", poolCreateParams))
 	}
+	var dp *C.dpiPool
 	if C.dpiPool_create(
 		d.dpiContext,
-		cUserName, C.uint32_t(len(P.Username)),
-		cPassword, C.uint32_t(len(P.Password)),
-		cSid, C.uint32_t(len(P.SID)),
+		cUserName, C.uint32_t(len(P.PoolParams.UserName)),
+		cPassword, C.uint32_t(len(P.PoolParams.Password)),
+		cSid, C.uint32_t(len(P.DSN)),
 		&commonCreateParams,
 		&poolCreateParams,
 		(**C.dpiPool)(unsafe.Pointer(&dp)),
@@ -442,14 +440,14 @@ func (dp *connPool) acquireConn(c *conn, P ConnectionParams) error {
 	}()
 
 	var lenUserName, lenPassword C.uint32_t
-	if P.HeterogeneousPool {
-		if P.Username != "" {
-			cUserName = C.CString(P.Username)
-			lenUserName = C.uint32_t(len(P.Username))
+	if P.Heterogeneous {
+		if P.PoolParams.UserName != "" {
+			cUserName = C.CString(P.PoolParams.UserName)
+			lenUserName = C.uint32_t(len(P.PoolParams.UserName))
 		}
-		if P.Password != "" {
-			cPassword = C.CString(P.Password)
-			lenPassword = C.uint32_t(len(P.Password))
+		if P.PoolParams.Password != "" {
+			cPassword = C.CString(P.PoolParams.Password)
+			lenPassword = C.uint32_t(len(P.PoolParams.Password))
 		}
 	}
 	if P.ConnClass != "" {
@@ -466,12 +464,12 @@ func (dp *connPool) acquireConn(c *conn, P ConnectionParams) error {
 		(**C.dpiConn)(unsafe.Pointer(&dc)),
 	) == C.DPI_FAILURE {
 		C.free(unsafe.Pointer(dc))
-		return errors.Errorf("acquirePoolConnection(user=%q, params=%#v): %w", P.Username, connCreateParams, c.getError())
+		return errors.Errorf("acquirePoolConnection(user=%q, params=%#v): %w", P.PoolParams.UserName, connCreateParams, c.getError())
 	}
 
 	c.mu.Lock()
 	c.dpiConn = (*C.dpiConn)(dc)
-	c.currentUser = P.Username
+	c.currentUser = P.PoolParams.UserName
 	c.newSession = connCreateParams.outNewSession == 1
 	c.mu.Unlock()
 	err := c.init(P.OnInit)
@@ -485,72 +483,68 @@ func (dp *connPool) acquireConn(c *conn, P ConnectionParams) error {
 	return err
 }
 
+func (pool *connPool) acquireConn2(c *conn, P ConnParams) error {
+	// populate connection creation parameters
+	var connCreateParams C.dpiConnCreateParams
+	if C.dpiContext_initConnCreateParams(c.drv.dpiContext, &connCreateParams) == C.DPI_FAILURE {
+		return errors.Errorf("initConnCreateParams: %w", c.getError())
+	}
+	if len(P.ShardingKey) > 0 {
+		var tempData C.dpiData
+		mem := C.malloc(C.sizeof_dpiShardingKeyColumn * C.size_t(len(P.ShardingKey)))
+		defer C.free(mem)
 
-func (pool *connPool) acquireConn2(c *conn, P *ConnParams) error {
+		columns := ((*[1 << 30]C.dpiShardingKeyColumn)(mem))[:len(P.ShardingKey)]
+		for i, value := range P.ShardingKey {
+			switch value := value.(type) {
+			case int:
+				columns[i].oracleTypeNum = C.DPI_ORACLE_TYPE_NUMBER
+				columns[i].nativeTypeNum = C.DPI_NATIVE_TYPE_INT64
+				C.dpiData_setInt64(&tempData, C.int64_t(value))
+			case string:
+				columns[i].oracleTypeNum = C.DPI_ORACLE_TYPE_VARCHAR
+				columns[i].nativeTypeNum = C.DPI_NATIVE_TYPE_BYTES
+				cs := C.CString(value)
+				defer C.free(unsafe.Pointer(cs))
+				C.dpiData_setBytes(&tempData, cs, C.uint32_t(len(value)))
+			default:
+				return errors.New("Unsupported data type for sharding")
+			}
+			columns[i].value = tempData.value
+		}
+		connCreateParams.shardingKeyColumns = &columns[0]
+		connCreateParams.numShardingKeyColumns = C.uint8_t(len(P.ShardingKey))
+	}
 
-    // populate connection creation parameters
-    var connCreateParams C.dpiConnCreateParams
-    if C.dpiContext_initConnCreateParams(c.drv.dpiContext, &connCreateParams) == C.DPI_FAILURE {
-        return errors.Errorf("initConnCreateParams: %w", "", c.getError())
-    }
-    if len(P.ShardingKey) > 0 {
-        var tempData C.dpiData
-        mem := C.malloc(C.sizeof_dpiShardingKeyColumn * C.size_t(len(P.ShardingKey)))
-        defer C.free(mem)
+	// acquire connection from the pool
+	dc := C.malloc(C.sizeof_void)
+	if Log != nil {
+		Log("C", "dpiPool_acquirePoolConnection", "conn", connCreateParams)
+	}
+	if C.dpiPool_acquireConnection(pool.dpiPool,
+		C._GoStringPtr(P.UserName), C.uint32_t(C._GoStringLen(P.UserName)),
+		C._GoStringPtr(P.Password), C.uint32_t(C._GoStringLen(P.Password)),
+		&connCreateParams,
+		(**C.dpiConn)(unsafe.Pointer(&dc))) == C.DPI_FAILURE {
+		C.free(unsafe.Pointer(dc))
+		return errors.Errorf("acquirePoolConnection: %w", c.getError())
+	}
 
-        columns := (*[1 << 30]C.dpiShardingKeyColumn)(mem)
-        for i, value := range P.ShardingKey {
-            switch value.(type) {
-            case int:
-                columns[i].oracleTypeNum = C.DPI_ORACLE_TYPE_NUMBER
-                columns[i].nativeTypeNum = C.DPI_NATIVE_TYPE_INT64
-                C.dpiData_setInt64(&tempData, C.int64_t(value.(int)))
-            case string:
-                columns[i].oracleTypeNum = C.DPI_ORACLE_TYPE_VARCHAR
-                columns[i].nativeTypeNum = C.DPI_NATIVE_TYPE_BYTES
-                strVal := value.(string)
-                cs := C.CString(strVal)
-                defer C.free(unsafe.Pointer(cs))
-                C.dpiData_setBytes(&tempData, cs, C.uint32_t(len(strVal)))
-            default:
-                return errors.New("Unsupported data type for sharding")
-            }
-            columns[i].value = tempData.value
-        }
-        connCreateParams.shardingKeyColumns = &columns[0]
-        connCreateParams.numShardingKeyColumns = C.uint8_t(len(P.ShardingKey))
-    }
+	c.dpiConn = (*C.dpiConn)(dc)
+	c.currentUser = P.UserName
+	c.newSession = connCreateParams.outNewSession == 1
+	c.Client, c.Server = c.drv.clientVersion, pool.serverVersion
+	c.timeZone, c.tzOffSecs = pool.timeZone, pool.tzOffSecs
+	err := c.init([]string{})
+	if err == nil {
+		c.mu.Lock()
+		pool.serverVersion = c.Server
+		pool.timeZone, pool.tzOffSecs = c.timeZone, c.tzOffSecs
+		c.mu.Unlock()
+	}
 
-    // acquire connection from the pool
-    dc := C.malloc(C.sizeof_void)
-    if Log != nil {
-        Log("C", "dpiPool_acquirePoolConnection", "conn", connCreateParams)
-    }
-    if C.dpiPool_acquireConnection(pool.dpiPool,
-            C._GoStringPtr(P.UserName), C.uint32_t(C._GoStringLen(P.UserName)),
-            C._GoStringPtr(P.Password), C.uint32_t(C._GoStringLen(P.Password)),
-            &connCreateParams,
-            (**C.dpiConn)(unsafe.Pointer(&dc))) == C.DPI_FAILURE {
-        C.free(unsafe.Pointer(dc))
-        return errors.Errorf("acquirePoolConnection: %w", c.getError())
-    }
-
-    c.dpiConn = (*C.dpiConn)(dc)
-    c.currentUser = P.UserName
-    c.newSession = connCreateParams.outNewSession == 1
-    c.Client, c.Server = c.drv.clientVersion, pool.serverVersion
-    c.timeZone, c.tzOffSecs = pool.timeZone, pool.tzOffSecs
-    err := c.init([]string{})
-    if err == nil {
-        c.mu.Lock()
-        pool.serverVersion = c.Server
-        pool.timeZone, pool.tzOffSecs = c.timeZone, c.tzOffSecs
-        c.mu.Unlock()
-    }
-
-    return err
+	return err
 }
-
 
 func (c *conn) acquireConn(user, pass, connClass string) error {
 	P := c.connParams
@@ -562,7 +556,7 @@ func (c *conn) acquireConn(user, pass, connClass string) error {
 		}
 		c.drv.mu.Unlock()
 		if pool != nil {
-			P.Username, P.Password, P.ConnClass = user, pass, connClass
+			P.PoolParams.UserName, P.PoolParams.Password, P.ConnClass = user, pass, connClass
 			return pool.acquireConn(c, P)
 		}
 	}
@@ -613,8 +607,8 @@ func (c *conn) acquireConn(user, pass, connClass string) error {
 	commonCreateParams.driverName = cDriverName
 	commonCreateParams.driverNameLength = C.uint32_t(len(DriverName))
 
-	if P.SID != "" {
-		cSid = C.CString(P.SID)
+	if P.DSN != "" {
+		cSid = C.CString(P.DSN)
 	}
 	connCreateParams.authMode = P.authMode()
 	extAuth := C.int(b2i(user == "" && pass == ""))
@@ -632,42 +626,51 @@ func (c *conn) acquireConn(user, pass, connClass string) error {
 		c.drv.dpiContext,
 		cUserName, C.uint32_t(len(user)),
 		cPassword, C.uint32_t(len(pass)),
-		cSid, C.uint32_t(len(P.SID)),
+		cSid, C.uint32_t(len(P.DSN)),
 		&commonCreateParams,
 		&connCreateParams,
 		(**C.dpiConn)(unsafe.Pointer(&dc)),
 	) == C.DPI_FAILURE {
 		C.free(unsafe.Pointer(dc))
-		return errors.Errorf("username=%q sid=%q params=%+v: %w", user, P.SID, connCreateParams, c.drv.getError())
+		return errors.Errorf("username=%q sid=%q params=%+v: %w", user, P.DSN, connCreateParams, c.drv.getError())
 	}
 	c.mu.Lock()
 	c.dpiConn = (*C.dpiConn)(dc)
 	c.currentUser = user
 	c.newSession = true
-	P.Username, P.Password, P.ConnClass = user, pass, connClass
+	P.ConnParams.UserName, P.ConnParams.Password, P.ConnClass = user, pass, connClass
 	if P.NewPassword != "" {
-		P.Password, P.NewPassword = P.NewPassword, ""
+		P.ConnParams.Password, P.NewPassword = P.NewPassword, ""
 	}
 	c.connParams = P
 	c.mu.Unlock()
 	return c.init(P.OnInit)
 }
 
+type PoolParams struct {
+	UserName, Password, DSN                    string
+	MinSessions, MaxSessions, SessionIncrement int
+	WaitTimeout, MaxLifeTime, SessionTimeout   time.Duration
+	Heterogeneous, EnableEvents                bool
+}
+
+type ConnParams struct {
+	UserName, Password, ConnClass           string
+	IsSysDBA, IsSysOper, IsSysASM, IsPrelim bool
+	ShardingKey, SuperShardingKey           []interface{}
+}
+
 // ConnectionParams holds the params for a connection (pool).
 // You can use ConnectionParams{...}.StringWithPassword()
 // as a connection string in sql.Open.
 type ConnectionParams struct {
-	OnInit                             []string
-	Username, Password, SID, ConnClass string
+	PoolParams
+	ConnParams
+	OnInit []string
 	// NewPassword is used iff StandaloneConnection is true!
-	NewPassword                              string
-	MinSessions, MaxSessions, PoolIncrement  int
-	WaitTimeout, MaxLifeTime, SessionTimeout time.Duration
-	Timezone                                 *time.Location
-	IsSysDBA, IsSysOper, IsSysASM, IsPrelim  bool
-	HeterogeneousPool                        bool
-	StandaloneConnection                     bool
-	EnableEvents                             bool
+	NewPassword          string
+	Timezone             *time.Location
+	StandaloneConnection bool
 }
 
 // String returns the string representation of ConnectionParams.
@@ -689,7 +692,7 @@ func (P ConnectionParams) StringWithPassword() string {
 }
 
 func (P ConnectionParams) string(class, withPassword bool) string {
-	host, path := P.SID, ""
+	host, path := P.DSN, ""
 	if i := strings.IndexByte(host, '/'); i >= 0 {
 		host, path = host[:i], host[i:]
 	}
@@ -700,12 +703,12 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 	}
 	q.Add("connectionClass", s)
 
-	password := P.Password
+	password := P.PoolParams.Password
 	if withPassword {
 		q.Add("newPassword", P.NewPassword)
 	} else {
 		hsh := fnv.New64()
-		io.WriteString(hsh, P.Password)
+		io.WriteString(hsh, P.PoolParams.Password)
 		password = "SECRET-" + base64.URLEncoding.EncodeToString(hsh.Sum(nil))
 		if P.NewPassword != "" {
 			hsh.Reset()
@@ -726,13 +729,13 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 	}
 	q.Add("poolMinSessions", strconv.Itoa(P.MinSessions))
 	q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
-	q.Add("poolIncrement", strconv.Itoa(P.PoolIncrement))
+	q.Add("poolIncrement", strconv.Itoa(P.SessionIncrement))
 	q.Add("sysdba", B(P.IsSysDBA))
 	q.Add("sysoper", B(P.IsSysOper))
 	q.Add("sysasm", B(P.IsSysASM))
 	q.Add("standaloneConnection", B(P.StandaloneConnection))
 	q.Add("enableEvents", B(P.EnableEvents))
-	q.Add("heterogeneousPool", B(P.HeterogeneousPool))
+	q.Add("heterogeneousPool", B(P.Heterogeneous))
 	q.Add("prelim", B(P.IsPrelim))
 	q.Add("poolWaitTimeout", P.WaitTimeout.String())
 	q.Add("poolSessionMaxLifetime", P.MaxLifeTime.String())
@@ -740,7 +743,7 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 	q["onInit"] = P.OnInit
 	return (&url.URL{
 		Scheme:   "oracle",
-		User:     url.UserPassword(P.Username, password),
+		User:     url.UserPassword(P.PoolParams.UserName, password),
 		Host:     host,
 		Path:     path,
 		RawQuery: q.Encode(),
@@ -749,31 +752,38 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 
 // Comb the several contradicting settings of the ConnectionParams.
 func (P *ConnectionParams) Comb() {
+	if P.ConnParams.UserName == "" {
+		P.ConnParams.UserName, P.ConnParams.Password = P.PoolParams.UserName, P.PoolParams.Password
+	}
 	P.StandaloneConnection = P.StandaloneConnection || P.ConnClass == NoConnectionPoolingConnectionClass
 	if P.IsPrelim || P.StandaloneConnection {
 		// Prelim: the shared memory may not exist when Oracle is shut down.
 		P.ConnClass = ""
-		P.HeterogeneousPool = false
+		P.Heterogeneous = false
 	}
 }
 
 // ParseConnString parses the given connection string into a struct.
 func ParseConnString(connString string) (ConnectionParams, error) {
 	P := ConnectionParams{
-		MinSessions:    DefaultPoolMinSessions,
-		MaxSessions:    DefaultPoolMaxSessions,
-		PoolIncrement:  DefaultPoolIncrement,
-		ConnClass:      DefaultConnectionClass,
-		MaxLifeTime:    DefaultMaxLifeTime,
-		WaitTimeout:    DefaultWaitTimeout,
-		SessionTimeout: DefaultSessionTimeout,
+		PoolParams: PoolParams{
+			MinSessions:      DefaultPoolMinSessions,
+			MaxSessions:      DefaultPoolMaxSessions,
+			SessionIncrement: DefaultPoolIncrement,
+			SessionTimeout:   DefaultSessionTimeout,
+			MaxLifeTime:      DefaultMaxLifeTime,
+			WaitTimeout:      DefaultWaitTimeout,
+		},
+		ConnParams: ConnParams{
+			ConnClass: DefaultConnectionClass,
+		},
 	}
 	if !strings.HasPrefix(connString, "oracle://") {
 		i := strings.IndexByte(connString, '/')
 		if i < 0 {
 			return P, errors.New("no '/' in connection string")
 		}
-		P.Username, connString = connString[:i], connString[i+1:]
+		P.PoolParams.UserName, connString = connString[:i], connString[i+1:]
 
 		uSid := strings.ToUpper(connString)
 		//fmt.Printf("connString=%q SID=%q\n", connString, uSid)
@@ -787,12 +797,12 @@ func ParseConnString(connString string) (ConnectionParams, error) {
 			}
 		}
 		if i = strings.IndexByte(connString, '@'); i >= 0 {
-			P.Password, P.SID = connString[:i], connString[i+1:]
+			P.PoolParams.Password, P.DSN = connString[:i], connString[i+1:]
 		} else {
-			P.Password = connString
+			P.PoolParams.Password = connString
 		}
-		if strings.HasSuffix(P.SID, ":POOLED") {
-			P.ConnClass, P.SID = "POOLED", P.SID[:len(P.SID)-7]
+		if strings.HasSuffix(P.DSN, ":POOLED") {
+			P.ConnClass, P.DSN = "POOLED", P.DSN[:len(P.DSN)-7]
 		}
 		//fmt.Printf("connString=%q params=%s\n", connString, P)
 		return P, nil
@@ -802,20 +812,21 @@ func ParseConnString(connString string) (ConnectionParams, error) {
 		return P, errors.Errorf("%s: %w", connString, err)
 	}
 	if usr := u.User; usr != nil {
-		P.Username = usr.Username()
-		P.Password, _ = usr.Password()
+		P.PoolParams.UserName = usr.Username()
+		P.PoolParams.Password, _ = usr.Password()
 	}
-	P.SID = u.Hostname()
+	P.ConnParams.UserName, P.ConnParams.Password = P.PoolParams.UserName, P.PoolParams.Password
+	P.DSN = u.Hostname()
 	// IPv6 literal address brackets are removed by u.Hostname,
 	// so we have to put them back
-	if strings.HasPrefix(u.Host, "[") && !strings.Contains(P.SID[1:], "]") {
-		P.SID = "[" + P.SID + "]"
+	if strings.HasPrefix(u.Host, "[") && !strings.Contains(P.DSN[1:], "]") {
+		P.DSN = "[" + P.DSN + "]"
 	}
 	if u.Port() != "" {
-		P.SID += ":" + u.Port()
+		P.DSN += ":" + u.Port()
 	}
 	if u.Path != "" && u.Path != "/" {
-		P.SID += u.Path
+		P.DSN += u.Path
 	}
 	q := u.Query()
 	if vv, ok := q["connectionClass"]; ok {
@@ -832,7 +843,7 @@ func ParseConnString(connString string) (ConnectionParams, error) {
 
 		{&P.StandaloneConnection, "standaloneConnection"},
 		{&P.EnableEvents, "enableEvents"},
-		{&P.HeterogeneousPool, "heterogeneousPool"},
+		{&P.Heterogeneous, "heterogeneousPool"},
 	} {
 		*task.Dest = q.Get(task.Key) == "1"
 	}
@@ -856,7 +867,7 @@ func ParseConnString(connString string) (ConnectionParams, error) {
 	}{
 		{&P.MinSessions, "poolMinSessions"},
 		{&P.MaxSessions, "poolMaxSessions"},
-		{&P.PoolIncrement, "poolIncrement"},
+		{&P.SessionIncrement, "poolIncrement"},
 	} {
 		s := q.Get(task.Key)
 		if s == "" {
@@ -901,9 +912,9 @@ func ParseConnString(connString string) (ConnectionParams, error) {
 		P.MinSessions = P.MaxSessions
 	}
 	if P.MinSessions == P.MaxSessions {
-		P.PoolIncrement = 0
-	} else if P.PoolIncrement < 1 {
-		P.PoolIncrement = 1
+		P.SessionIncrement = 0
+	} else if P.SessionIncrement < 1 {
+		P.SessionIncrement = 1
 	}
 	P.OnInit = q["onInit"]
 
@@ -1098,28 +1109,7 @@ type connector struct {
 	drv    *drv
 	onInit func(driver.Conn) error
 	ConnectionParams
-    *PoolParams
-    *ConnParams
 }
-
-type PoolParams struct {
-    UserName, Password, DSN string
-    MinSessions, MaxSessions, SessionIncrement int
-    WaitTimeout, MaxLifeTime, SessionTimeout time.Duration
-    Heterogeneous, EnableEvents bool
-}
-
-type ConnParams struct {
-    UserName, Password, ConnClass string
-    IsSysDBA, IsSysOper, IsSysASM, IsPrelim bool
-    ShardingKey, SuperShardingKey []interface{}
-}
-
-func NewConnector2(poolParams *PoolParams, connParams *ConnParams) driver.Connector {
-    return connector{PoolParams: poolParams, ConnParams: connParams,
-            drv: defaultDrv}
-}
-
 
 // OpenConnector must parse the name in the same format that Driver.Open
 // parses the name parameter.
@@ -1144,33 +1134,22 @@ func (d *drv) OpenConnector(name string) (driver.Connector, error) {
 // The returned connection is only used by one goroutine at a
 // time.
 func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
-    if c.PoolParams != nil {
-        pool, err := c.drv.openPool(c.PoolParams)
-        if err != nil {
-            return nil, err
-        }
-        connection := conn{drv: c.drv, timeZone: time.Local}
-        if err := pool.acquireConn2(&connection, c.ConnParams); err != nil {
-            return nil, err
-        }
-        return &connection, nil
-    }
-	P := c.ConnectionParams
-	if key := ctx.Value(userpwCtxKey); key != nil {
-		if userpw, ok := key.([3]string); ok {
-			P.Username = userpw[0]
-			P.Password = userpw[1]
-		}
-	}
-	conn, err := c.drv.openConn(P)
-	if err != nil || c.onInit == nil || !conn.newSession {
-		return conn, err
-	}
-	if err = c.onInit(conn); err != nil {
-		conn.close(true)
+	pool, err := c.drv.openPool(c.PoolParams)
+	if err != nil {
 		return nil, err
 	}
-	return conn, nil
+	connection := &conn{drv: c.drv, timeZone: time.Local}
+	if err := pool.acquireConn2(connection, c.ConnParams); err != nil {
+		return nil, err
+	}
+	if err != nil || c.onInit == nil || !connection.newSession {
+		return connection, err
+	}
+	if err = c.onInit(connection); err != nil {
+		connection.close(true)
+		return nil, err
+	}
+	return connection, nil
 }
 
 // Driver returns the underlying Driver of the Connector,
@@ -1182,23 +1161,14 @@ func (c connector) Driver() driver.Driver { return c.drv }
 // which calls the given onInit if the connection is new.
 //
 // For an onInit example, see NewSessionIniter.
-func (d *drv) NewConnector(name string, onInit func(driver.Conn) error) (driver.Connector, error) {
-	cxr, err := d.OpenConnector(name)
-	if err != nil {
-		return nil, err
-	}
-	cx := cxr.(connector)
-	cx.onInit = onInit
-	return cx, err
-}
-
-// NewConnector returns a driver.Connector to be used with sql.OpenDB,
-// (for the default Driver registered with godror)
-// which calls the given onInit if the connection is new.
-//
-// For an onInit example, see NewSessionIniter.
 func NewConnector(name string, onInit func(driver.Conn) error) (driver.Connector, error) {
-	return defaultDrv.NewConnector(name, onInit)
+	cI, err := defaultDrv.OpenConnector(name)
+	if err != nil || onInit == nil {
+		return cI, err
+	}
+	cxr := cI.(connector)
+	cxr.onInit = onInit
+	return cxr, nil
 }
 
 // NewSessionIniter returns a function suitable for use in NewConnector as onInit,

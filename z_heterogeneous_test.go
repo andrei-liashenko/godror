@@ -18,7 +18,7 @@ import (
 	godror "github.com/godror/godror"
 )
 
-func TestHeterogeneousPoolIntegration(t *testing.T) {
+func TestHeterogeneousIntegration(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -30,8 +30,8 @@ func TestHeterogeneousPoolIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cs.HeterogeneousPool = true
-	username := cs.Username
+	cs.Heterogeneous = true
+	username := cs.PoolParams.UserName
 	testHeterogeneousConStr := cs.StringWithPassword()
 	t.Log(testHeterogeneousConStr)
 
@@ -94,9 +94,9 @@ func TestContextWithUserPassw(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cs.HeterogeneousPool = true
-	username, password := cs.Username, cs.Password
-	cs.Username, cs.Password = "", ""
+	cs.Heterogeneous = true
+	username, password := cs.PoolParams.UserName, cs.PoolParams.Password
+	cs.PoolParams.UserName, cs.PoolParams.Password = "", ""
 	testHeterogeneousConStr := cs.StringWithPassword()
 	t.Log(testHeterogeneousConStr)
 
